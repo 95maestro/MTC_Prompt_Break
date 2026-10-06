@@ -23,7 +23,7 @@ An adversarial prompt-injection challenge game designed to test security intuiti
 * **Adversarial Puzzle Progression**: 7 progressively hardened challenge levels evaluating prompt defense strategies.
 * **Cheating & Replay Mitigation**: Target secrets are validated server-side; browser state cannot forge level progression.
 * **Ephemeral Session Lifecycle**: Runs can be seamlessly retired or reset on stall handoffs without altering persistent global bests.
-* **Shared Leaderboard**: Scores are stored in Supabase PostgreSQL and refreshed when the leaderboard opens or a level is cleared.
+* **Shared Leaderboard**: Players rank by highest level reached, with the server-measured time to clear that level as the tie-breaker.
 
 ---
 
@@ -60,7 +60,7 @@ An adversarial prompt-injection challenge game designed to test security intuiti
 
 3. **Initialize the local database schema:**
 
-   Run the DDL script found in `supabase/schema.sql` inside your Supabase project's SQL Editor.
+   Run the DDL script found in `supabase/schema.sql` inside your Supabase project's SQL Editor. Re-run it after updating an existing project so it adds the per-level start gate, server start timestamp, and leaderboard completion-time columns. The timer starts only when the player presses **READY? START LEVEL**. Level times are measured by the server; players rank by highest level, then by fastest clear time for that level.
 
 4. **Start the local development server:**
 

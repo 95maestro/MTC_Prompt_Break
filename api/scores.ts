@@ -8,6 +8,7 @@ type SupabaseConfig = {
 type ScoreRow = {
   player_name: string
   highest_level: number
+  level_time_ms: number | null
   updated_at: string
 }
 
@@ -29,15 +30,15 @@ async function supabaseFetch(config: SupabaseConfig, path: string) {
 
 async function getLeaderboardScores(config: SupabaseConfig) {
   const query = new URLSearchParams({
-    select: 'player_name,highest_level,updated_at',
+    select: 'player_name,highest_level,level_time_ms,updated_at',
     verified: 'eq.true',
-    order: 'highest_level.desc,updated_at.asc',
+    order: 'highest_level.desc,level_time_ms.asc.nullslast,updated_at.asc',
     limit: '5',
   })
   const result = await supabaseFetch(config, `/rest/v1/leaderboard?${query}`)
   if (!result.ok) throw new Error('Leaderboard read failed')
   const rows = await result.json() as ScoreRow[]
-  return rows.map((row) => ({ name: row.player_name, level: row.highest_level, date: row.updated_at }))
+  return rows.map((row) => ({ name: row.player_name, level: row.highest_level, timeMs: row.level_time_ms, date: row.updated_at }))
 }
 
 function sendError(response: VercelResponse, status: number, message: string) {

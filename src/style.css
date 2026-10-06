@@ -138,6 +138,14 @@ h1 em { font-style: normal; color: #e66c42; }
 .win-panel p { flex: 1; margin: 0; font-size: 11px; color: #52624b; }
 .next-button { display: flex; align-items: center; gap: 8px; min-height: 35px; padding: 0 11px; border: 0; background: #527b32; color: white; border-radius: 3px; font: 500 9px var(--mono); cursor: pointer; white-space: nowrap; }
 .next-button:hover { background: #3b6220; }
+.level-ready-panel { min-height: 110px; margin: 0 15px 11px; padding: 14px; display: flex; align-items: center; gap: 11px; border: 1px dashed #55565e; border-radius: 5px; background: #15161b; }
+.ready-mark { width: 36px; height: 36px; display: grid; place-items: center; flex: none; color: #ff536b; background: #32131b; border: 1px solid #642031; border-radius: 4px; }
+.ready-copy { flex: 1; min-width: 0; display: grid; gap: 5px; }
+.ready-copy strong { color: #f3f0ed; font: 600 10px var(--mono); }
+.ready-copy span { color: #a2a2aa; font-size: 10px; line-height: 1.45; }
+.start-level-button { min-height: 38px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; flex: none; color: white; background: #c8102e; border: 1px solid #ed1b3b; border-radius: 3px; cursor: pointer; font: 600 9px var(--mono); }
+.start-level-button:hover:not(:disabled) { background: #ed1b3b; }
+.start-level-button:disabled { opacity: .6; cursor: wait; }
 
 .starter-row { padding: 12px 1px 0; }
 .starter-heading { display: flex; align-items: center; gap: 6px; color: #7d8b7d; font: 500 8px var(--mono); }
@@ -164,6 +172,8 @@ h1 em { font-style: normal; color: #e66c42; }
 .hint-button > svg { transition: transform .15s; }
 .hint-open > svg { transform: rotate(90deg); }
 .hint-copy { margin-top: 7px; padding: 9px; border-left: 2px solid #b3d68d; background: #f2f7eb; color: #586c4e; font-size: 10px; line-height: 1.45; animation: arrive .18s ease-out; }
+.ai-permission { display: flex; align-items: center; gap: 6px; margin-top: 9px; color: #8a8b94; font-size: 9px; line-height: 1.35; }
+.ai-permission svg { flex: none; color: #68c9e8; }
 .levels-panel { padding: 13px 13px 8px; }
 .level-icon { color: #d18249; }
 .level-count { margin-left: auto; color: #7c8a7c; font-size: 8px; }
@@ -235,6 +245,8 @@ h1 em { color: #ed1b3b; }
 .stat-chip { color: #efeeec; background: #131418; border-color: #303137; }
 .stat-lime { color: #ff4059; background: #32131b; }
 .stat-blue { color: #65cbed; background: #11232b; }
+.stat-red { color: #ff536b; background: #32131b; }
+.timer-chip b { font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat-chip small { color: #95969e; }
 .stat-chip b i { color: #777982; }
 .mission-strip { background: #211116; border-color: #48202a; border-left-color: #e31837; }
@@ -300,6 +312,8 @@ h1 em { color: #ed1b3b; }
 .hint-button { color: #e2dfe0; border-color: #383940; background: #191a1f; }
 .hint-button:hover { border-color: #792137; background: #241219; }
 .hint-copy { color: #e7d7da; border-left-color: #ed1b3b; background: #261319; }
+.ai-permission { color: #a1a2aa; }
+.ai-permission svg { color: #67cbed; }
 .level-button:hover:not(:disabled) { background: #211419; }
 .level-active { background: #251219; border-color: #642031; }
 .level-number { color: #aaaab1; background: #222329; }
@@ -333,6 +347,7 @@ h1 em { color: #ed1b3b; }
 .score-player { color: #eeecea; }
 .score-player small { background: #551826; color: #ff9aa8; }
 .score-level { color: #ff536b; }
+.score-level i { display: block; margin-top: 3px; color: #c1b6b9; font: 400 8px var(--mono); text-align: right; }
 .score-empty { color: #a3a3aa; }
 .local-only-note { color: #b7b6ba; border-color: #393a41; background: #1a1b20; }
 .local-only-note svg { color: #65cbed; }
@@ -411,6 +426,9 @@ h1 em { color: #ed1b3b; }
   .send-button svg { width: 16px; }
   .terminal-footer { padding: 0 9px; font-size: 6px; }
   .win-panel { margin: 0 9px 8px; gap: 7px; padding: 9px; }
+  .level-ready-panel { min-height: 126px; margin: 0 9px 8px; padding: 10px; flex-wrap: wrap; }
+  .ready-copy { flex-basis: calc(100% - 50px); }
+  .start-level-button { width: 100%; }
   .win-stamp { font-size: 8px; }
   .win-panel p { flex-basis: 100%; order: 2; }
   .next-button { flex: 1; justify-content: center; }

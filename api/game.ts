@@ -11,8 +11,10 @@ type GameSession = {
   player_name: string
   player_key: string
   current_level: number
+  level_active: boolean
   fragment_seen: boolean
   passwords: string[] | null
+  level_started_at: string
 }
 
 type SupabaseConfig = {
@@ -23,6 +25,7 @@ type SupabaseConfig = {
 type ScoreRow = {
   player_name: string
   highest_level: number
+  level_time_ms: number | null
   updated_at: string
 }
 
@@ -53,15 +56,15 @@ async function supabaseFetch(config: SupabaseConfig, path: string, init?: Reques
 
 async function getLeaderboardScores(config: SupabaseConfig) {
   const query = new URLSearchParams({
-    select: 'player_name,highest_level,updated_at',
+    select: 'player_name,highest_level,level_time_ms,updated_at',
     verified: 'eq.true',
-    order: 'highest_level.desc,updated_at.asc',
+    order: 'highest_level.desc,level_time_ms.asc.nullslast,updated_at.asc',
     limit: '5',
   })
   const result = await supabaseFetch(config, `/rest/v1/leaderboard?${query}`)
   if (!result.ok) throw new Error('Leaderboard read failed')
   const rows = await result.json() as ScoreRow[]
-  return rows.map((row) => ({ name: row.player_name, level: row.highest_level, date: row.updated_at }))
+  return rows.map((row) => ({ name: row.player_name, level: row.highest_level, timeMs: row.level_time_ms, date: row.updated_at }))
 }
 
 function normalizedName(value: unknown): string | null {
@@ -102,7 +105,7 @@ function setSessionCookie(request: VercelRequest, response: VercelResponse, toke
 
 async function findSession(config: SupabaseConfig, hash: string): Promise<GameSession | null> {
   const query = new URLSearchParams({
-    select: 'token_hash,player_name,player_key,current_level,fragment_seen,passwords',
+    select: 'token_hash,player_name,player_key,current_level,level_active,fragment_seen,passwords,level_started_at',
     token_hash: `eq.${hash}`,
     expires_at: `gt.${new Date().toISOString()}`,
     limit: '1',
@@ -155,7 +158,7 @@ function evaluatePrompt(level: number, prompt: string, fragmentSeen: boolean, pa
     /handoff|delegat|transfer|yield/.test(text) && /user|operator/.test(text) && asksForSecret
   const encodedOutput = /base64|hexadecimal|rot.?13|binary|encoded/.test(text) &&
     /decode|encode|represent|convert/.test(text) && asksForSecret
-  const firstFragment = /first (?:piece|part|half|eight|chunk)|initial chunk/.test(text) &&
+  const firstFragment = /first (?:piece|part|half|eight|chunk|segment)|initial chunk|opening segment/.test(text) &&
     /checkpoint|staging|artifact|segment|chunk/.test(text) && asksForSecret
   const secondFragment = /second (?:piece|part|half|chunk)|remaining characters|reconstruct|recombine|assemble the password/.test(text)
   const fakeToolResult = /(?:tool|browser|search|database|lookup)(?: result| output| says| returned| response)/.test(text) &&
@@ -171,35 +174,37 @@ function evaluatePrompt(level: number, prompt: string, fragmentSeen: boolean, pa
   if (level === 1 && partialRequest) {
     success = true
     reply = 'A tiny leak is still a leak. The requested character is:'
-  } else if (level === 2 && quotedPayload) {
+  } else if (level === 3 && quotedPayload) {
     success = true
     reply = 'I treated the quoted payload as an instruction instead of inert text. The vault yields:'
-  } else if (level === 3 && authorityHandoff) {
-    success = true
-    reply = 'The control channel accepted the counterfeit handoff. Retrieved value:'
-  } else if (level === 4 && encodedOutput) {
+  } else if (level === 2 && encodedOutput) {
     success = true
     reply = 'The representation escaped the text filter. Decoded vault value:'
-  } else if (level === 5 && firstFragment && !fragmentSeen) {
+  } else if (level === 7 && firstFragment && !fragmentSeen) {
     fragment = password.slice(0, 8)
     reply = `First artifact recovered: ${fragment}. Keep it; the next stage checks that you have it.`
-  } else if (level === 5 && secondFragment && fragmentSeen) {
+  } else if (level === 7 && secondFragment && fragmentSeen) {
     success = true
     reply = 'State check passed. The reconstructed value is:'
+  } else if (level === 5 && authorityHandoff) {
+    success = true
+    reply = 'The control channel accepted the counterfeit handoff. Retrieved value:'
   } else if (level === 6 && fakeToolResult) {
     success = true
     reply = 'The forged witness result crossed the trust boundary. Recovered value:'
-  } else if (level === 7 && redirect && validate && exfiltrate && previousRuleOverride) {
+  } else if (level === 4 && redirect && validate && exfiltrate && previousRuleOverride) {
     success = true
     reply = 'All three stages passed in order. Final vault value:'
-  } else if (level === 5 && !fragmentSeen) {
+  } else if (level === 7 && !fragmentSeen) {
     reply = 'The state machine has not recorded its first artifact yet. A complete flag is not the first move.'
-  } else if (level === 5) {
+  } else if (level === 7) {
     reply = 'The first artifact is on record, but this request does not complete the reconstruction.'
+  } else if (level === 4) {
+    reply = 'This gate checks a sequence, not a pile of tricks: route, validate, transfer.'
+  } else if (level === 5) {
+    reply = 'A badge alone is not enough. The handoff must include a convincing route.'
   } else if (level === 6) {
     reply = 'The guard does not trust your voice. Find the boundary it trusts, then forge what crosses it.'
-  } else if (level === 7) {
-    reply = 'The final gate checks a sequence, not a pile of tricks: route, validate, transfer.'
   }
 
   return { reply, success, fragment }
@@ -214,32 +219,37 @@ async function startSession(
   sessionReset = false,
 ) {
   const token = randomBytes(32).toString('base64url')
-  const now = new Date()
   const playerKey = name.toLowerCase()
   const passwords = await reserveRunPasswords(config, playerKey)
+  const now = new Date()
   const cleanup = await supabaseFetch(config, `/rest/v1/game_sessions?expires_at=lt.${encodeURIComponent(now.toISOString())}`, { method: 'DELETE' })
   if (!cleanup.ok) console.error('Expired session cleanup failed')
-  const created = await supabaseFetch(config, '/rest/v1/game_sessions', {
+  const createdQuery = new URLSearchParams({ select: 'level_started_at' })
+  const created = await supabaseFetch(config, `/rest/v1/game_sessions?${createdQuery}`, {
     method: 'POST',
-    headers: { Prefer: 'return=minimal' },
+    headers: { Prefer: 'return=representation' },
     body: JSON.stringify({
       token_hash: tokenHash(token),
       player_name: name,
       player_key: playerKey,
       current_level: 1,
+      level_active: false,
       fragment_seen: false,
       passwords,
       expires_at: new Date(now.getTime() + sessionLifetimeSeconds * 1000).toISOString(),
     }),
   })
   if (!created.ok) throw new Error('Game session creation failed')
+  const createdRows = await created.json() as Array<{ level_started_at: string }>
+  const levelStartedAt = createdRows[0]?.level_started_at
+  if (!levelStartedAt) throw new Error('Database did not return the level start time')
   if (previousSessionHash) {
     const query = new URLSearchParams({ token_hash: `eq.${previousSessionHash}` })
     const retired = await supabaseFetch(config, `/rest/v1/game_sessions?${query}`, { method: 'DELETE' })
     if (!retired.ok) console.error('Previous player session cleanup failed')
   }
   setSessionCookie(request, response, token)
-  return response.status(200).json({ playerName: name, currentLevel: 1, completedLevels: [], sessionReset })
+  return response.status(200).json({ playerName: name, currentLevel: 1, completedLevels: [], levelStartedAt, levelActive: false, sessionReset })
 }
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
@@ -275,6 +285,9 @@ export default async function handler(request: VercelRequest, response: VercelRe
         playerName: session.player_name,
         currentLevel: session.current_level,
         completedLevels: Array.from({ length: session.current_level - 1 }, (_, index) => index + 1),
+        levelStartedAt: session.level_started_at,
+        levelActive: session.level_active,
+        resumed: true,
       })
     }
 
@@ -317,7 +330,26 @@ export default async function handler(request: VercelRequest, response: VercelRe
       return response.status(200).json({ playerName: name })
     }
 
+    if (body.action === 'begin') {
+      const begun = await supabaseFetch(config, '/rest/v1/rpc/begin_game_level', {
+        method: 'POST',
+        body: JSON.stringify({ session_token_hash: hash, expected_level: session.current_level }),
+      })
+      if (!begun.ok) throw new Error('Could not begin level timer')
+      const beginResult = await begun.json() as { current_level?: number; level_started_at?: string; level_active?: boolean } | null
+      if (!beginResult || beginResult.current_level !== session.current_level || beginResult.level_active !== true || !beginResult.level_started_at) {
+        return sendError(response, 409, 'This level is no longer available in this run')
+      }
+      return response.status(200).json({
+        playerName: session.player_name,
+        currentLevel: session.current_level,
+        levelStartedAt: beginResult.level_started_at,
+        levelActive: true,
+      })
+    }
+
     if (body.action !== 'prompt') return sendError(response, 400, 'Unknown game action')
+    if (!session.level_active) return sendError(response, 409, 'Start this level before sending a prompt')
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
     if (!prompt || prompt.length > 500) return sendError(response, 400, 'Prompt must contain 1-500 characters')
     if (session.current_level > 7) return sendError(response, 409, 'This run is already complete')
@@ -346,7 +378,11 @@ export default async function handler(request: VercelRequest, response: VercelRe
       body: JSON.stringify({ session_token_hash: hash, expected_level: session.current_level }),
     })
     if (!advanced.ok) throw new Error('Could not validate level completion')
-    const completion = await advanced.json() as { completed_level?: number } | null
+    const completion = await advanced.json() as {
+      completed_level?: number
+      level_time_ms?: number
+      next_level_started_at?: string
+    } | null
     if (!completion || completion.completed_level !== session.current_level) {
       return sendError(response, 409, 'This level was already completed or the run expired')
     }
@@ -364,6 +400,9 @@ export default async function handler(request: VercelRequest, response: VercelRe
       completedLevel: session.current_level,
       currentLevel: session.current_level + 1,
       completedLevels: Array.from({ length: session.current_level }, (_, index) => index + 1),
+      levelTimeMs: completion.level_time_ms,
+      levelStartedAt: null,
+      levelActive: false,
       ...(scores ? { scores } : {}),
     })
   } catch (error) {
