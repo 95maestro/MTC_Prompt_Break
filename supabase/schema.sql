@@ -27,10 +27,12 @@ create index leaderboard_verified_rank_idx
 create table if not exists public.game_sessions (
   token_hash text primary key check (char_length(token_hash) = 64),
   player_name text not null check (char_length(player_name) between 1 and 14),
+  player_email text,
   player_key text not null check (char_length(player_key) between 1 and 14),
   current_level smallint not null check (current_level between 1 and 8),
   level_active boolean not null default false,
   fragment_seen boolean not null default false,
+  progress_state jsonb not null default '{"version":[3]}'::jsonb,
   passwords jsonb,
   level_started_at timestamptz not null default clock_timestamp(),
   expires_at timestamptz not null
@@ -38,6 +40,24 @@ create table if not exists public.game_sessions (
 
 alter table public.game_sessions
   add column if not exists passwords jsonb;
+
+alter table public.game_sessions
+  add column if not exists player_email text;
+
+alter table public.game_sessions
+  add column if not exists progress_state jsonb not null default '{"version":[3]}'::jsonb;
+
+alter table public.game_sessions
+  alter column progress_state set default '{"version":[3]}'::jsonb;
+
+-- Reset sessions carrying progress from the previous challenge ruleset once.
+update public.game_sessions
+set current_level = 1,
+    level_active = false,
+    fragment_seen = false,
+    progress_state = '{"version":[3]}'::jsonb,
+    level_started_at = clock_timestamp()
+where progress_state->'version' is distinct from '[3]'::jsonb;
 
 alter table public.game_sessions
   add column if not exists level_started_at timestamptz;
@@ -158,6 +178,7 @@ begin
   update public.game_sessions
   set current_level = expected_level + 1,
       fragment_seen = false,
+      progress_state = '{"version":[3]}'::jsonb,
       level_active = false,
       level_started_at = completed_at
   where token_hash = session_token_hash;
@@ -242,16 +263,101 @@ begin
 end;
 $$;
 
+create or replace function public.restart_game_level(
+  session_token_hash text,
+  expected_level smallint
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $$
+declare
+  active_session public.game_sessions;
+  restarted_at timestamptz;
+begin
+  select * into active_session
+  from public.game_sessions
+  where token_hash = session_token_hash
+    and expires_at > now()
+  for update;
+
+  if not found
+    or expected_level not between 1 and 7
+    or active_session.current_level not in (expected_level, expected_level + 1) then
+    return null;
+  end if;
+
+  restarted_at := clock_timestamp();
+  update public.game_sessions
+  set current_level = expected_level,
+      fragment_seen = false,
+      progress_state = '{"version":[3]}'::jsonb,
+      level_active = false,
+      level_started_at = restarted_at
+  where token_hash = session_token_hash;
+
+  return jsonb_build_object(
+    'current_level', expected_level,
+    'level_started_at', restarted_at,
+    'level_active', false
+  );
+end;
+$$;
+
+create or replace function public.restart_game_run(
+  session_token_hash text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog
+as $$
+declare
+  active_session public.game_sessions;
+  restarted_at timestamptz;
+begin
+  select * into active_session
+  from public.game_sessions
+  where token_hash = session_token_hash
+    and expires_at > now()
+  for update;
+
+  if not found then
+    return null;
+  end if;
+
+  restarted_at := clock_timestamp();
+  update public.game_sessions
+  set current_level = 1,
+      fragment_seen = false,
+      progress_state = '{"version":[3]}'::jsonb,
+      level_active = false,
+      level_started_at = restarted_at
+  where token_hash = session_token_hash;
+
+  return jsonb_build_object(
+    'current_level', 1,
+    'level_started_at', restarted_at,
+    'level_active', false
+  );
+end;
+$$;
+
 revoke all on public.leaderboard from public, anon, authenticated;
 revoke all on public.game_sessions from public, anon, authenticated;
 revoke all on public.used_game_passwords from public, anon, authenticated;
 revoke all on function public.mark_fragment_seen(text, smallint) from public, anon, authenticated;
 revoke all on function public.complete_game_level(text, smallint) from public, anon, authenticated;
 revoke all on function public.begin_game_level(text, smallint) from public, anon, authenticated;
+revoke all on function public.restart_game_level(text, smallint) from public, anon, authenticated;
+revoke all on function public.restart_game_run(text) from public, anon, authenticated;
 revoke all on function public.reserve_game_passwords(text, jsonb) from public, anon, authenticated;
 grant select on public.leaderboard to service_role;
 grant select, insert, update, delete on public.game_sessions to service_role;
 grant execute on function public.mark_fragment_seen(text, smallint) to service_role;
 grant execute on function public.complete_game_level(text, smallint) to service_role;
 grant execute on function public.begin_game_level(text, smallint) to service_role;
+grant execute on function public.restart_game_level(text, smallint) to service_role;
+grant execute on function public.restart_game_run(text) to service_role;
 grant execute on function public.reserve_game_passwords(text, jsonb) to service_role;

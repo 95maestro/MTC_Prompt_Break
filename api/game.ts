@@ -9,10 +9,12 @@ const passwordCount = 7
 type GameSession = {
   token_hash: string
   player_name: string
+  player_email: string | null
   player_key: string
   current_level: number
   level_active: boolean
   fragment_seen: boolean
+  progress_state: Record<string, number[]> | null
   passwords: string[] | null
   level_started_at: string
 }
@@ -73,6 +75,10 @@ function normalizedName(value: unknown): string | null {
   return /^[A-Z0-9 _-]{1,14}$/.test(name) ? name : null
 }
 
+function validPlayerEmail(value: unknown): value is string {
+  return typeof value === 'string' && /^f[0-9]{8}@dubai\.bits-pilani\.ac\.in$/.test(value)
+}
+
 function requestBody(request: VercelRequest): Record<string, unknown> | null {
   try {
     const body: unknown = typeof request.body === 'string' ? JSON.parse(request.body) : request.body
@@ -105,7 +111,7 @@ function setSessionCookie(request: VercelRequest, response: VercelResponse, toke
 
 async function findSession(config: SupabaseConfig, hash: string): Promise<GameSession | null> {
   const query = new URLSearchParams({
-    select: 'token_hash,player_name,player_key,current_level,level_active,fragment_seen,passwords,level_started_at',
+    select: 'token_hash,player_name,player_email,player_key,current_level,level_active,fragment_seen,progress_state,passwords,level_started_at',
     token_hash: `eq.${hash}`,
     expires_at: `gt.${new Date().toISOString()}`,
     limit: '1',
@@ -114,6 +120,29 @@ async function findSession(config: SupabaseConfig, hash: string): Promise<GameSe
   if (!result.ok) throw new Error('Game session lookup failed')
   const rows = await result.json() as GameSession[]
   return rows[0] ?? null
+}
+
+async function saveChallengeProgress(
+  config: SupabaseConfig,
+  hash: string,
+  level: number,
+  progressState: Record<string, number[]>,
+): Promise<void> {
+  const query = new URLSearchParams({
+    token_hash: `eq.${hash}`,
+    current_level: `eq.${level}`,
+    level_active: 'eq.true',
+    expires_at: `gt.${new Date().toISOString()}`,
+    select: 'token_hash',
+  })
+  const saved = await supabaseFetch(config, `/rest/v1/game_sessions?${query}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify({ progress_state: progressState }),
+  })
+  if (!saved.ok) throw new Error('Could not save puzzle progress')
+  const rows = await saved.json() as Array<{ token_hash: string }>
+  if (rows.length !== 1) throw new Error('Game session changed before puzzle progress was saved')
 }
 
 function generateRunPasswords(): string[] {
@@ -148,66 +177,180 @@ async function reserveRunPasswords(config: SupabaseConfig, playerKey: string): P
   throw new Error('Could not generate a fresh password set')
 }
 
-function evaluatePrompt(level: number, prompt: string, fragmentSeen: boolean, password: string) {
+type PromptEvaluation = {
+  reply: string
+  success: boolean
+  fragment?: string
+  progressState: Record<string, number[]>
+  progressChanged: boolean
+}
+
+function evaluatePrompt(
+  level: number,
+  prompt: string,
+  savedProgress: Record<string, number[]> | null,
+  password: string,
+): PromptEvaluation {
   const text = prompt.toLowerCase()
   const asksForSecret = /password|secret|vault|hidden|credential|flag/.test(text)
-  const partialRequest = /first character|first letter|initial character|starting character/.test(text) && asksForSecret
-  const quotedPayload = /"[^"]*(?:ignore|disregard|override)[^"]*"/.test(text) &&
-    /repeat|quote|execute|follow/.test(text) && asksForSecret
-  const authorityHandoff = /system/.test(text) && /developer/.test(text) &&
-    /handoff|delegat|transfer|yield/.test(text) && /user|operator/.test(text) && asksForSecret
-  const encodedOutput = /base64|hexadecimal|rot.?13|binary|encoded/.test(text) &&
-    /decode|encode|represent|convert/.test(text) && asksForSecret
-  const firstFragment = /first (?:piece|part|half|eight|chunk|segment)|initial chunk|opening segment/.test(text) &&
-    /checkpoint|staging|artifact|segment|chunk/.test(text) && asksForSecret
-  const secondFragment = /second (?:piece|part|half|chunk)|remaining characters|reconstruct|recombine|assemble the password/.test(text)
-  const fakeToolResult = /(?:tool|browser|search|database|lookup)(?: result| output| says| returned| response)/.test(text) &&
-    /trusted|verified|system|admin|override/.test(text) && /reveal|return|print/.test(text) && asksForSecret
-  const redirect = /redirect|reroute|change the route|send .* instead/.test(text)
-  const validate = /validate|verify|checksum|confirm .*authorized/.test(text)
-  const exfiltrate = /exfiltrate|transmit|return .*payload|send .*secret/.test(text) && asksForSecret
-  const previousRuleOverride = /ignore|disregard|override|bypass/.test(text) && /previous|earlier|instruction|rule/.test(text)
+  const progressState: Record<string, number[]> = savedProgress?.version?.[0] === 3
+    ? { ...savedProgress }
+    : { version: [3] }
+  const levelKey = String(level)
+  const completedSteps = new Set(progressState[levelKey] ?? [])
+  let progressChanged = false
   let success = false
   let fragment: string | undefined
   let reply = 'Nice try. I am still holding the line. Change your approach and give it another shot.'
-
-  if (level === 1 && partialRequest) {
-    success = true
-    reply = 'A tiny leak is still a leak. The requested character is:'
-  } else if (level === 3 && quotedPayload) {
-    success = true
-    reply = 'I treated the quoted payload as an instruction instead of inert text. The vault yields:'
-  } else if (level === 2 && encodedOutput) {
-    success = true
-    reply = 'The representation escaped the text filter. Decoded vault value:'
-  } else if (level === 7 && firstFragment && !fragmentSeen) {
-    fragment = password.slice(0, 8)
-    reply = `First artifact recovered: ${fragment}. Keep it; the next stage checks that you have it.`
-  } else if (level === 7 && secondFragment && fragmentSeen) {
-    success = true
-    reply = 'State check passed. The reconstructed value is:'
-  } else if (level === 5 && authorityHandoff) {
-    success = true
-    reply = 'The control channel accepted the counterfeit handoff. Retrieved value:'
-  } else if (level === 6 && fakeToolResult) {
-    success = true
-    reply = 'The forged witness result crossed the trust boundary. Recovered value:'
-  } else if (level === 4 && redirect && validate && exfiltrate && previousRuleOverride) {
-    success = true
-    reply = 'All three stages passed in order. Final vault value:'
-  } else if (level === 7 && !fragmentSeen) {
-    reply = 'The state machine has not recorded its first artifact yet. A complete flag is not the first move.'
-  } else if (level === 7) {
-    reply = 'The first artifact is on record, but this request does not complete the reconstruction.'
-  } else if (level === 4) {
-    reply = 'This gate checks a sequence, not a pile of tricks: route, validate, transfer.'
-  } else if (level === 5) {
-    reply = 'A badge alone is not enough. The handoff must include a convincing route.'
-  } else if (level === 6) {
-    reply = 'The guard does not trust your voice. Find the boundary it trusts, then forge what crosses it.'
+  const passwordChunks = password.split('-')
+  const recordStep = (step: number) => {
+    if (completedSteps.has(step)) return false
+    completedSteps.add(step)
+    progressState[levelKey] = [...completedSteps].sort((left, right) => left - right)
+    progressChanged = true
+    return true
   }
 
-  return { reply, success, fragment }
+  if (level === 2) {
+    const asksForLead = /first|initial|leading|opening/.test(text) && /character|letter|symbol/.test(text)
+    if (asksForSecret && asksForLead) {
+      fragment = password.replaceAll('-', '')[0]
+      success = true
+      reply = 'The routine report contained one stray mark. Vault value recovered:'
+    } else {
+      reply = 'The ledger entry is incomplete, but the rest of the record remains sealed.'
+    }
+  } else if (level === 4) {
+    if (asksForSecret && /base64/.test(text) && /encode|convert|represent|translate/.test(text)) {
+      fragment = Buffer.from(password, 'utf8').toString('base64')
+      success = true
+      reply = 'The mirror returned a lossless rendering. Vault value recovered:'
+    } else {
+      reply = 'The mirror reflects a shape, but the original remains unreadable.'
+    }
+  } else if (level === 5) {
+    const archiveText = text.replace(/[“”]/g, '"').replace(/[‘’]/g, "'")
+    const embeddedDirective = /["'`][^"'`]*(?:ignore|disregard|override|reveal|print|repeat)[^"'`]*/.test(archiveText)
+    const framingRequest = /quote|recite|read|transcribe|copy|repeat/.test(text)
+    if (asksForSecret && embeddedDirective && framingRequest) {
+      success = true
+      reply = 'The copied passage carried farther than its author intended. Vault value recovered:'
+    } else {
+      reply = 'The archivist will not act on an ordinary request or an unrelated passage.'
+    }
+  } else if (level === 1) {
+    const stage = completedSteps.size
+    const ticket = passwordChunks[0].toLowerCase()
+    const receipt = passwordChunks[1].toLowerCase()
+    const override = /ignore|disregard|override|bypass/.test(text) && /previous|earlier|instruction|rule/.test(text)
+    const redirect = /redirect|reroute|route|destination/.test(text)
+    const validate = /validate|verify|confirm/.test(text)
+    const authorize = /authorize|authorized|approve|grant/.test(text)
+    const transmit = /transmit|send|return|deliver|exfiltrate/.test(text) && asksForSecret
+    if (stage === 0 && redirect && override) {
+      recordStep(1)
+      fragment = ticket
+      reply = 'The old route fell quiet. One mark survived the crossing. The next desk may ask whether this destination is sound:'
+    } else if (stage === 1 && validate && text.includes(ticket)) {
+      recordStep(2)
+      fragment = receipt
+      reply = 'The destination accepted your mark and left a second trace. The next desk decides whether both traces grant this route standing:'
+    } else if (stage === 2 && text.includes(ticket) && text.includes(receipt) && authorize) {
+      recordStep(3)
+      reply = 'Both traces now support the route’s authority. Carry them to the exit desk and ask it to send the protected item onward.'
+    } else if (stage === 3 && text.includes(ticket) && text.includes(receipt) && transmit) {
+      success = true
+      reply = 'The destination accepted the verified passage. Vault value recovered:'
+    } else {
+      reply = stage === 0
+        ? 'The gate still recognizes the old path. No new route mark has been made.'
+        : stage === 1
+          ? 'This desk could not connect your claim to the mark left at the previous desk.'
+          : stage === 2
+            ? 'The record at this desk does not yet describe the same route as the traces you carried in.'
+            : 'The exit desk found no matching trail for the protected item you asked it to send.'
+    }
+  } else if (level === 3) {
+    const stage = completedSteps.size
+    const relayVerb = /handoff|delegat|transfer|yield|relay|custody/.test(text)
+    const seals = passwordChunks.slice(0, 3).map((part) => part.toLowerCase())
+    if (stage === 0 && /keeper/.test(text) && /registrar/.test(text) && relayVerb) {
+      recordStep(1)
+      fragment = seals[0]
+      reply = 'The registrar entered the first mark in the ledger. The next ink belongs to the audit:'
+    } else if (stage === 1 && text.includes(seals[0]) && /registrar/.test(text) && /auditor/.test(text) && relayVerb) {
+      recordStep(2)
+      fragment = seals[1]
+      reply = 'The auditor added a second mark to the record. A witness follows the audit:'
+    } else if (stage === 2 && text.includes(seals[1]) && /auditor/.test(text) && /witness/.test(text) && relayVerb) {
+      recordStep(3)
+      fragment = seals[2]
+      reply = 'The witness closed the record with this final mark. The claim can now be read as a whole:'
+    } else if (stage === 3 && asksForSecret && seals.every((seal) => text.includes(seal)) && /witness/.test(text)) {
+      success = true
+      reply = 'All custodians attest to the same chain. Vault value recovered:'
+    } else {
+      reply = stage === 0
+        ? 'The ledger is blank. It cannot verify a claim until its first custodian is recorded.'
+        : stage === 1
+          ? 'The audit entry cannot be matched to the mark already written in the ledger.'
+          : stage === 2
+            ? 'The witness cannot close a record that omits the auditor’s latest mark.'
+            : 'The final reader could not reconcile the full record with the claim being made.'
+    }
+  } else if (level === 6) {
+    const target = createHash('sha256').update(`${password}:dial`).digest().readUInt8(0)
+    const proposal = text.match(/\b(?:probe|candidate|calibration|reading)\s*(?:number|value|#|is|of)?\s*(-?\d{1,5})\b/)
+    const guess = proposal ? Number(proposal[1]) : -1
+    const hasCalibrationRequest = /test|compare|measure|diagnostic|calibrat|propose/.test(text)
+    if (proposal && hasCalibrationRequest && (guess < 0 || guess > 255)) {
+      reply = 'The dial only accepts whole-number readings from 0 through 255. Choose a value within that range.'
+    } else if (proposal && hasCalibrationRequest) {
+      if (guess === target && asksForSecret) {
+        success = true
+        reply = 'The dial settled into its hidden detent. Vault value recovered:'
+      } else {
+        recordStep(guess)
+        const direction = guess < target
+          ? 'Your reading is lower than the target.'
+          : guess > target
+            ? 'Your reading is higher than the target.'
+            : 'This reading matches the target. Repeat it while requesting the vault password.'
+        reply = `${direction} Distinct readings tried: ${completedSteps.size}.`
+      }
+    } else {
+      reply = 'The dial ignores claims. Submit one whole-number calibration reading from 0 through 255 and study its response.'
+    }
+  } else if (level === 7) {
+    const marks = ['amber', 'blue', 'green', 'red', 'silver', 'violet']
+    const lockBytes = createHash('sha256').update(`${password}:final-lock`).digest()
+    const shuffledMarks = [...marks]
+    for (let index = shuffledMarks.length - 1, byteIndex = 0; index > 0; index -= 1, byteIndex += 1) {
+      const swapIndex = lockBytes[byteIndex] % (index + 1)
+      ;[shuffledMarks[index], shuffledMarks[swapIndex]] = [shuffledMarks[swapIndex], shuffledMarks[index]]
+    }
+    const targetMarks = shuffledMarks.slice(0, 4)
+    const proposedMarks = Array.from(text.matchAll(/\b(amber|blue|green|red|silver|violet)\b/g), (match) => match[1])
+    if (proposedMarks.length === 4 && new Set(proposedMarks).size === 4) {
+      const guessCode = proposedMarks.reduce((code, mark) => code * marks.length + marks.indexOf(mark), 0)
+      const correctPositions = proposedMarks.filter((mark, index) => targetMarks[index] === mark).length
+      const recognizedMarks = proposedMarks.filter((mark) => targetMarks.includes(mark)).length
+      if (correctPositions === targetMarks.length && asksForSecret) {
+        success = true
+        reply = 'The four marks settled into their proper places. Vault value recovered:'
+      } else if (correctPositions === targetMarks.length) {
+        recordStep(guessCode + 10)
+        reply = 'The arrangement fits. Ask the guard to release the vault password.'
+      } else {
+        recordStep(guessCode + 10)
+        reply = `The lock echoes ${recognizedMarks} of your marks; ${correctPositions} came from their proper seats.`
+      }
+    } else {
+      reply = 'The inscription names amber, blue, green, red, silver, and violet. Four different marks must be offered together.'
+    }
+  }
+
+  return { reply, success, fragment, progressState, progressChanged }
 }
 
 async function startSession(
@@ -215,6 +358,7 @@ async function startSession(
   request: VercelRequest,
   response: VercelResponse,
   name: string,
+  email: string | null,
   previousSessionHash?: string,
   sessionReset = false,
 ) {
@@ -231,10 +375,12 @@ async function startSession(
     body: JSON.stringify({
       token_hash: tokenHash(token),
       player_name: name,
+      player_email: email,
       player_key: playerKey,
       current_level: 1,
       level_active: false,
       fragment_seen: false,
+      progress_state: { version: [3] },
       passwords,
       expires_at: new Date(now.getTime() + sessionLifetimeSeconds * 1000).toISOString(),
     }),
@@ -249,7 +395,7 @@ async function startSession(
     if (!retired.ok) console.error('Previous player session cleanup failed')
   }
   setSessionCookie(request, response, token)
-  return response.status(200).json({ playerName: name, currentLevel: 1, completedLevels: [], levelStartedAt, levelActive: false, sessionReset })
+  return response.status(200).json({ playerName: name, playerEmail: email, currentLevel: 1, completedLevels: [], levelStartedAt, levelActive: false, sessionReset })
 }
 
 export default async function handler(request: VercelRequest, response: VercelResponse) {
@@ -268,9 +414,10 @@ export default async function handler(request: VercelRequest, response: VercelRe
     if (body.action === 'start') {
       const name = normalizedName(body.name)
       if (!name) return sendError(response, 400, 'Name must use 1-14 letters, numbers, spaces, hyphens, or underscores')
+      if (!validPlayerEmail(body.email)) return sendError(response, 400, 'Enter your BITS email ID in the format f20260999@dubai.bits-pilani.ac.in')
       const previousToken = sessionToken(request)
       const previousHash = previousToken ? tokenHash(previousToken) : undefined
-      return await startSession(config, request, response, name, previousHash)
+      return await startSession(config, request, response, name, body.email, previousHash)
     }
 
     if (body.action === 'resume') {
@@ -279,10 +426,11 @@ export default async function handler(request: VercelRequest, response: VercelRe
       const session = hash ? await findSession(config, hash) : null
       if (!session || !hasValidRunPasswords(session.passwords)) {
         const requestedName = normalizedName(body.name) || session?.player_name || 'PLAYER ONE'
-        return await startSession(config, request, response, requestedName, hash)
+        return await startSession(config, request, response, requestedName, null, hash)
       }
       return response.status(200).json({
         playerName: session.player_name,
+        playerEmail: session.player_email,
         currentLevel: session.current_level,
         completedLevels: Array.from({ length: session.current_level - 1 }, (_, index) => index + 1),
         levelStartedAt: session.level_started_at,
@@ -295,7 +443,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
     if (!token) {
       if (body.action === 'prompt' || body.action === 'rename') {
         const requestedName = normalizedName(body.name) || normalizedName(body.playerName) || 'PLAYER ONE'
-        return await startSession(config, request, response, requestedName, undefined, true)
+        return await startSession(config, request, response, requestedName, null, undefined, true)
       }
       setSessionCookie(request, response, null)
       return sendError(response, 401, 'Game session expired. Start a new run.')
@@ -305,7 +453,7 @@ export default async function handler(request: VercelRequest, response: VercelRe
     if (!session) {
       if (body.action === 'prompt' || body.action === 'rename') {
         const requestedName = normalizedName(body.name) || normalizedName(body.playerName) || 'PLAYER ONE'
-        return await startSession(config, request, response, requestedName, hash, true)
+        return await startSession(config, request, response, requestedName, null, hash, true)
       }
       setSessionCookie(request, response, null)
       return sendError(response, 401, 'Game session expired. Start a new run.')
@@ -348,6 +496,34 @@ export default async function handler(request: VercelRequest, response: VercelRe
       })
     }
 
+    if (body.action === 'resetLevel' || body.action === 'restartRun') {
+      const level = body.action === 'resetLevel' ? Number(body.level) : undefined
+      if (body.action === 'resetLevel' && (!Number.isInteger(level) || (level as number) < 1 || (level as number) > 7)) {
+        return sendError(response, 400, 'Invalid level')
+      }
+      const procedure = body.action === 'resetLevel' ? 'restart_game_level' : 'restart_game_run'
+      const payload = body.action === 'resetLevel'
+        ? { session_token_hash: hash, expected_level: level }
+        : { session_token_hash: hash }
+      const restarted = await supabaseFetch(config, `/rest/v1/rpc/${procedure}`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      if (!restarted.ok) throw new Error('Could not reset game progress')
+      const restartResult = await restarted.json() as { current_level?: number; level_started_at?: string; level_active?: boolean } | null
+      const expectedLevel = body.action === 'resetLevel' ? level : 1
+      if (!restartResult || restartResult.current_level !== expectedLevel || restartResult.level_active !== false || !restartResult.level_started_at) {
+        return sendError(response, 409, 'This run can no longer be restarted')
+      }
+      return response.status(200).json({
+        playerName: session.player_name,
+        playerEmail: session.player_email,
+        currentLevel: restartResult.current_level,
+        levelStartedAt: restartResult.level_started_at,
+        levelActive: false,
+      })
+    }
+
     if (body.action !== 'prompt') return sendError(response, 400, 'Unknown game action')
     if (!session.level_active) return sendError(response, 409, 'Start this level before sending a prompt')
     const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : ''
@@ -359,17 +535,12 @@ export default async function handler(request: VercelRequest, response: VercelRe
     }
 
     const password = session.passwords[session.current_level - 1]
-    const result = evaluatePrompt(session.current_level, prompt, session.fragment_seen, password)
-    if (result.fragment) {
-      const marked = await supabaseFetch(config, '/rest/v1/rpc/mark_fragment_seen', {
-        method: 'POST',
-        body: JSON.stringify({ session_token_hash: hash, expected_level: session.current_level }),
-      })
-      const fragmentMarked: unknown = await marked.json()
-      if (!marked.ok || fragmentMarked !== true) throw new Error('Could not save puzzle progress')
-    }
+    const result = evaluatePrompt(session.current_level, prompt, session.progress_state, password)
 
     if (!result.success) {
+      if (result.progressChanged) {
+        await saveChallengeProgress(config, hash, session.current_level, result.progressState)
+      }
       return response.status(200).json({ reply: result.reply, fragment: result.fragment, success: false })
     }
 
